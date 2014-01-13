@@ -40,6 +40,7 @@ func main() {
 	for {
 		select {
 		case <-c:
+			executor.Stop()
 			os.Exit(1)
 		}
 	}
