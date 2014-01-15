@@ -133,7 +133,29 @@ func (me *Executor) processEvent(event *etcd.Response) error {
 	log.Printf("[handler] Processing event: %s -> %s (%d / %d / %d)",
 		event.Action, event.Node.Key, event.EtcdIndex, event.RaftIndex, event.RaftTerm)
 
+    // Handle the event according to action.
+    switch event.Action {
+    case "get":
+        return me.handleGet(event)
+    case "set":
+        return me.handleSet(event)
+    case "delete":
+        return me.handleDelete(event)
+    }
+
 	return nil
+}
+
+func (me *Executor) handleGet(event *etcd.Response) error {
+    return nil
+}
+
+func (me *Executor) handleSet(event *etcd.Response) error {
+    return nil
+}
+
+func (me *Executor) handleDelete(event *etcd.Response) error {
+    return nil
 }
 
 func (me *Executor) checkHistoryForIndex(index uint64) bool {
