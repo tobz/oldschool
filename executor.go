@@ -1,12 +1,19 @@
 package oldschool
 
 import "github.com/coreos/go-etcd/etcd"
+import "path/filepath"
 import "strconv"
+import "strings"
+import "fmt"
 import "log"
+import "os"
 
 const (
 	EtcdErrEventIndexCleared = 401
 	EtcdErrKeyNotFound       = 100
+	DefaultDirectoryMode     = os.ModeDir | os.ModeSetgid | 0775
+	DefaultFileMode          = 0644
+	DefaultFileFlags         = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
 )
 
 type Executor struct {
@@ -14,6 +21,17 @@ type Executor struct {
 	etcdClient   *etcd.Client
 	baseDir      string
 	baseEtcdDir  string
+	currentIndex uint64
+	Statistics   *ExecutorStatistics
+}
+
+type ExecutorStatistics struct {
+	DirectoriesCreated uint64
+	FilesWritten       uint64
+	SetsReceived       uint64
+	SetsProcessed      uint64
+	DeletesReceived    uint64
+	DeletesProcessed   uint64
 }
 
 func NewExecutor(executorName string, etcdClient *etcd.Client, baseDir string, baseEtcdDir string) *Executor {
@@ -22,6 +40,8 @@ func NewExecutor(executorName string, etcdClient *etcd.Client, baseDir string, b
 		etcdClient:   etcdClient,
 		baseDir:      baseDir,
 		baseEtcdDir:  baseEtcdDir,
+		currentIndex: 0,
+		Statistics:   &ExecutorStatistics{},
 	}
 }
 
@@ -33,7 +53,7 @@ func (me *Executor) Run() error {
 	}
 
 	if lastProcessedIndex != 0 {
-		log.Printf("[runner] Found indicator of previous work: last processed index set as '%d'", lastProcessedIndex)
+		log.Printf("[runner] Found potential indicator of previous work: last processed index set as '%d'", lastProcessedIndex)
 
 		// See if our last processed index is still in etcd's history.
 		presentInHistory := me.checkHistoryForIndex(lastProcessedIndex)
@@ -45,7 +65,7 @@ func (me *Executor) Run() error {
 		}
 	}
 
-	log.Print("[runner] No previous indicator of work found.  Starting this node from scratch...")
+	log.Print("[runner] No previous work found.  Starting this node from scratch...")
 
 	// Either we've never done anything or we're too far out of sync, so start from scratch.
 	return me.startFromScratch()
@@ -76,6 +96,12 @@ func (me *Executor) startFromScratch() error {
 		for {
 			select {
 			case event := <-events:
+				// Make sure this isn't a hidden node, unless it's a get, in which case it's fine. We just don't
+				// want to bother handling the node metadata that gets set.
+				if isHiddenNode(event.Node.Key) && event.Action != "get" {
+					continue
+				}
+
 				log.Printf("[processor] Received event: %s -> %s (%d / %d / %d)",
 					event.Action, event.Node.Key, event.EtcdIndex, event.RaftIndex, event.RaftTerm)
 
@@ -130,32 +156,174 @@ func (me *Executor) startFromLastIndex() error {
 }
 
 func (me *Executor) processEvent(event *etcd.Response) error {
+	var highestIndex uint64
+	var err error
+
 	log.Printf("[handler] Processing event: %s -> %s (%d / %d / %d)",
 		event.Action, event.Node.Key, event.EtcdIndex, event.RaftIndex, event.RaftTerm)
 
-    // Handle the event according to action.
-    switch event.Action {
-    case "get":
-        return me.handleGet(event)
-    case "set":
-        return me.handleSet(event)
-    case "delete":
-        return me.handleDelete(event)
-    }
+	// Handle the event according to action.
+	switch event.Action {
+	case "get":
+		highestIndex, err = me.handleGet(event)
+	case "set":
+		me.Statistics.SetsReceived++
+		highestIndex, err = me.handleSet(event)
+	case "delete":
+		me.Statistics.DeletesReceived++
+		highestIndex, err = me.handleDelete(event)
+	}
+
+	if err != nil {
+		return err
+	}
+
+	// If we actually processed something, update our processed index.
+	if highestIndex != 0 {
+		log.Printf("[handler] Successfully processed %s -> %s, with a high index of %d", event.Action, event.Node.Key, highestIndex)
+
+		switch event.Action {
+		case "set":
+			me.Statistics.SetsProcessed++
+		case "delete":
+			me.Statistics.DeletesProcessed++
+		}
+
+		// Set the highest index we processed.  This might be lower than our previous highest, in which case
+		// the overall highest won't change.
+		return me.setLastProcessedIndex(highestIndex)
+	} else {
+		log.Printf("[handler] Successfully processed %s -> %s, but index reported as 0", event.Action, event.Node.Key)
+	}
 
 	return nil
 }
 
-func (me *Executor) handleGet(event *etcd.Response) error {
-    return nil
+func (me *Executor) handleGet(event *etcd.Response) (uint64, error) {
+	// Pass this off to our subordinate, since we are recursively challenged.
+	return me.handleGetImpl(event.Node)
 }
 
-func (me *Executor) handleSet(event *etcd.Response) error {
-    return nil
+func (me *Executor) handleGetImpl(node *etcd.Node) (uint64, error) {
+	// Set the highest index as the node we got.  Child nodes might usurp this.
+	highestIndex := node.ModifiedIndex
+
+	// If we have a directory, just try and parse its children nodes.  If it has none, just
+	// create the directory.
+	if node.Dir {
+		// Create the directory it represents first.
+		err := me.createDirectory(node.Key)
+		if err != nil {
+			return 0, err
+		}
+
+		me.Statistics.DirectoriesCreated++
+
+		// Now go through any children nodes this node may have, and process them all.
+		for _, childNode := range node.Nodes {
+			index, err := me.handleGetImpl(&childNode)
+			if err != nil {
+				return 0, err
+			}
+
+			if index > highestIndex {
+				highestIndex = index
+			}
+		}
+	} else {
+		// Seems that we just have a value.  Write it.
+		err := me.writeFile(node.Key, node.Value)
+		if err != nil {
+			return 0, err
+		}
+
+		me.Statistics.FilesWritten++
+	}
+
+	return highestIndex, nil
 }
 
-func (me *Executor) handleDelete(event *etcd.Response) error {
-    return nil
+func (me *Executor) handleSet(event *etcd.Response) (uint64, error) {
+	var err error
+
+	if event.Node.Dir {
+		// This is just a directory.
+		err = me.createDirectory(event.Node.Key)
+
+		if err == nil {
+			me.Statistics.DirectoriesCreated++
+		}
+	} else {
+		// Looks like we have a file, weee!
+		err = me.writeFile(event.Node.Key, event.Node.Value)
+
+		if err == nil {
+			me.Statistics.FilesWritten++
+		}
+	}
+
+	return event.Node.ModifiedIndex, err
+}
+
+func (me *Executor) handleDelete(event *etcd.Response) (uint64, error) {
+	return 0, nil
+}
+
+func (me *Executor) createDirectory(directoryName string) error {
+	absoluteDir := me.getOnDiskPath(directoryName)
+
+	return os.MkdirAll(absoluteDir, DefaultDirectoryMode)
+}
+
+func (me *Executor) writeFile(fileName string, value string) error {
+	absoluteFile := me.getOnDiskPath(fileName)
+	absoluteDir := filepath.Dir(absoluteFile)
+
+	if !doesPathExist(absoluteDir) {
+		// Create the directory it represents first.
+		err := os.MkdirAll(absoluteDir, DefaultDirectoryMode)
+		if err != nil {
+			return err
+		}
+
+		me.Statistics.DirectoriesCreated++
+	}
+
+	// Try and chmod the path to our default file mode.  The file might not actually exist yet.
+	// If it does, and it's not the right mode, it's most likely not writable by us anyways and
+	// our subsequent open will fail.  We tried.
+	os.Chmod(absoluteFile, DefaultFileMode)
+
+	// Now let's actually try and write to the file.
+	file, err := os.OpenFile(absoluteFile, DefaultFileFlags, DefaultFileMode)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		err := file.Close()
+		if err != nil {
+			log.Fatalf("got error when closing file: %s", err)
+		}
+	}()
+
+	n, err := file.WriteString(value)
+	if err != nil {
+		return err
+	}
+
+	if n != len(value) {
+		return fmt.Errorf("tried to write value of len %d to %s; only wrote %d", len(value), absoluteFile, n)
+	}
+
+	// Lastly, sync it so it gets persisted to disk like... right meow.
+	return file.Sync()
+}
+
+func (me *Executor) getOnDiskPath(key string) string {
+	trimmedPath := strings.Trim(key, "/ ")
+	unprefixedPath := strings.TrimPrefix(trimmedPath, me.baseEtcdDir)
+	return filepath.Join(me.baseDir, unprefixedPath)
 }
 
 func (me *Executor) checkHistoryForIndex(index uint64) bool {
@@ -168,20 +336,17 @@ func (me *Executor) getLastProcessedIndex() (uint64, error) {
 	response, err := me.etcdClient.Get(me.baseEtcdDir+"/_executors/_"+me.executorName, false, false)
 	if err != nil {
 		// If we simply couldn't find the key - that's not an issue, per se.  We only care about
-		// failures of the cluster or something.
+		// failures of the cluster or something. Started from the bottom, now we here.
 		if errorIsEtcdError(err, EtcdErrKeyNotFound) {
 			return 0, nil
 		}
 
-		// Couldn't find anything.  Started from the bottom, now we here.
 		return 0, err
 	}
 
 	// This is the simplest way to convert a string to a uint64.  Ugh.
 	index, err := strconv.ParseUint(response.Node.Value, 10, 64)
 	if err != nil {
-		// I like clearly defined error handling situations, but fuck it.  I'm returning a
-		// zero if something stupid happened and we set this to a non-numeric value.
 		return 0, err
 	}
 
@@ -189,8 +354,31 @@ func (me *Executor) getLastProcessedIndex() (uint64, error) {
 }
 
 func (me *Executor) setLastProcessedIndex(index uint64) error {
+	// If we don't have a cached value, try and cache it.
+	if me.currentIndex == 0 {
+		currentIndex, err := me.getLastProcessedIndex()
+		if err != nil {
+			return err
+		}
+
+		me.currentIndex = currentIndex
+	}
+
+	// If we're already past this point, don't try and update anything.
+	if index <= me.currentIndex {
+		return nil
+	}
+
+	// Now set the current index locally and in etcd.
+	me.currentIndex = index
+
 	_, err := me.etcdClient.Set(me.baseEtcdDir+"/_executors/_"+me.executorName, strconv.FormatUint(index, 10), 0)
 	return err
+}
+
+func doesPathExist(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func errorIsEtcdError(err error, errCode int) bool {
@@ -201,4 +389,9 @@ func errorIsEtcdError(err error, errCode int) bool {
 	// If the error code we're checking for is -1, we're just trying to match an EtcdError, but not a specific one.
 	etcdErr, ok := err.(*etcd.EtcdError)
 	return ok && (etcdErr.ErrorCode == errCode || errCode == -1)
+}
+
+func isHiddenNode(key string) bool {
+	baseKey := filepath.Base(key)
+	return strings.HasPrefix(baseKey, "_")
 }
