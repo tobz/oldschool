@@ -27,7 +27,9 @@ type Executor struct {
 
 type ExecutorStatistics struct {
 	DirectoriesCreated uint64
+	DirectoriesDeleted uint64
 	FilesWritten       uint64
+	FilesDeleted       uint64
 	SetsReceived       uint64
 	SetsProcessed      uint64
 	DeletesReceived    uint64
@@ -266,12 +268,21 @@ func (me *Executor) handleSet(event *etcd.Response) (uint64, error) {
 }
 
 func (me *Executor) handleDelete(event *etcd.Response) (uint64, error) {
-	return 0, nil
+	err := me.unlinkPath(event.Node.Key)
+	if err == nil {
+		if event.Node.Dir {
+			// This is just a directory.
+			me.Statistics.DirectoriesDeleted++
+		} else {
+			me.Statistics.FilesDeleted++
+		}
+	}
+
+	return event.Node.ModifiedIndex, err
 }
 
 func (me *Executor) createDirectory(directoryName string) error {
 	absoluteDir := me.getOnDiskPath(directoryName)
-
 	return os.MkdirAll(absoluteDir, DefaultDirectoryMode)
 }
 
@@ -318,6 +329,11 @@ func (me *Executor) writeFile(fileName string, value string) error {
 
 	// Lastly, sync it so it gets persisted to disk like... right meow.
 	return file.Sync()
+}
+
+func (me *Executor) unlinkPath(key string) error {
+	absolutePath := me.getOnDiskPath(key)
+	return os.Remove(absolutePath)
 }
 
 func (me *Executor) getOnDiskPath(key string) string {

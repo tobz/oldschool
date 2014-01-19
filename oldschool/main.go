@@ -28,7 +28,7 @@ func init() {
 
 func main() {
 	// Set etcd to debug mode for all da info.
-	etcd.OpenDebug()
+	//etcd.OpenDebug()
 
 	// Create our etcd client and make sure we can sync to the cluster.
 	etcdClient := etcd.NewClient(strings.Split(*joinNode, ","))
@@ -48,7 +48,9 @@ func main() {
 	// Spin around and spit out some statistics and such.
 	statsTick := time.Tick(time.Second * 2)
 	for _ = range statsTick {
-		log.Printf("[main] dc: %d, fw: %d, sets: %d/%d, deletes: %d/%d", executor.Statistics.DirectoriesCreated, executor.Statistics.FilesWritten,
-			executor.Statistics.SetsProcessed, executor.Statistics.SetsReceived, executor.Statistics.DeletesProcessed, executor.Statistics.DeletesReceived)
+		log.Printf("[main] dirs: %d/%d, files: %d/%d, sets: %d/%d, deletes: %d/%d",
+			executor.Statistics.DirectoriesCreated, executor.Statistics.DirectoriesDeleted, executor.Statistics.FilesWritten,
+			executor.Statistics.FilesDeleted, executor.Statistics.SetsProcessed, executor.Statistics.SetsReceived,
+			executor.Statistics.DeletesProcessed, executor.Statistics.DeletesReceived)
 	}
 }
