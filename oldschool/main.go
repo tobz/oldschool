@@ -2,7 +2,6 @@ package main
 
 import "flag"
 import "log"
-import "time"
 import "strings"
 import "github.com/coreos/go-etcd/etcd"
 import "github.com/tobz/oldschool"
@@ -41,16 +40,5 @@ func main() {
 	// Now create our change executor.  This guy keeps track of and waits for changes, and then executes them
 	// by turning the key into a file path, mirroring the keys on disk.
 	executor := oldschool.NewExecutor(*executorName, etcdClient, *baseDir, *baseEtcdDir)
-	go func() {
-		log.Fatal(executor.Run())
-	}()
-
-	// Spin around and spit out some statistics and such.
-	statsTick := time.Tick(time.Second * 2)
-	for _ = range statsTick {
-		log.Printf("[main] dirs: %d/%d, files: %d/%d, sets: %d/%d, deletes: %d/%d",
-			executor.Statistics.DirectoriesCreated, executor.Statistics.DirectoriesDeleted, executor.Statistics.FilesWritten,
-			executor.Statistics.FilesDeleted, executor.Statistics.SetsProcessed, executor.Statistics.SetsReceived,
-			executor.Statistics.DeletesProcessed, executor.Statistics.DeletesReceived)
-	}
+	log.Fatal(executor.Run())
 }
