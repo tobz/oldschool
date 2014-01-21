@@ -44,7 +44,7 @@ and here's what it looks like on disk to add and remove values from etcd
     $ find .
     .
     ./confs
-    ./confs/
+    ./confs/services
     ./confs/services/app.json
      
     $ curl -L http://127.0.0.1:4001/v2/keys/oldschool/confs/services/web.json -X PUT -d value="[5,6,7,8,9]"
