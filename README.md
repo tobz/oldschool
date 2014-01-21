@@ -1,7 +1,7 @@
 oldschool
 =========
 
-old-fashioned configuration management
+old-fashioned configuration data management
 
 
 what the hell is this
