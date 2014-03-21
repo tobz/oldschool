@@ -84,7 +84,6 @@ func NewExecutor(executorName string, etcdClient *etcd.Client, baseDir string, b
 func (e *Executor) Run() error {
 	// Start our metric collection.
 	go metrics.CaptureRuntimeMemStats(e.metricsRegistry, time.Second*10)
-	go metrics.Log(e.metricsRegistry, 2e9, log.New(os.Stderr, "metrics: ", log.Lmicroseconds))
 
 	// Figure out if we've done any work in the past, and if we can pick it back up.
 	lastProcessedIndex, err := e.getLastProcessedIndex()
@@ -161,14 +160,24 @@ func (e *Executor) startFromScratch() error {
 	// Now we need to bulk load the data and process it.
 	response, err := e.etcdClient.Get(e.baseEtcdDir, false, true)
 	if err != nil {
-		log.Printf("[bootstrap] Caught error while trying to get the universe: %s", err)
-		return err
-	}
+		if errorIsEtcdError(err, etcdErrKeyNotFound) {
+			log.Printf("[bootstrap] Base directory doesn't exist.  Creating it...")
 
-	err = e.processEvent(response)
-	if err != nil {
-		log.Printf("[bootstrap] Caught an error while trying to process our bootstrap get: %s", err)
-		return err
+			_, err = e.etcdClient.SetDir(e.baseEtcdDir, 0)
+			if err != nil {
+				log.Printf("[bootstrap] Failed to create base directory: %s", err)
+				return err
+			}
+		} else {
+			log.Printf("[bootstrap] Caught error while trying to get the universe: %s", err)
+			return err
+		}
+	} else {
+		err = e.processEvent(response)
+		if err != nil {
+			log.Printf("[bootstrap] Caught an error while trying to process our bootstrap get: %s", err)
+			return err
+		}
 	}
 
 	log.Print("[bootstrap] Starting processor...")
@@ -382,7 +391,7 @@ func (e *Executor) getOnDiskPath(key string) string {
 
 func (e *Executor) checkHistoryForIndex(index uint64) bool {
 	_, err := e.etcdClient.Watch(e.baseEtcdDir, index, true, nil, nil)
-	return errorIsetcdError(err, etcdErrEventIndexCleared)
+	return errorIsEtcdError(err, etcdErrEventIndexCleared)
 }
 
 func (e *Executor) getLastProcessedIndex() (uint64, error) {
@@ -391,7 +400,7 @@ func (e *Executor) getLastProcessedIndex() (uint64, error) {
 	if err != nil {
 		// If we simply couldn't find the key - that's not an issue, per se.  We only care about
 		// failures of the cluster or something. Started from the bottom, now we here.
-		if errorIsetcdError(err, etcdErrKeyNotFound) {
+		if errorIsEtcdError(err, etcdErrKeyNotFound) {
 			return 0, nil
 		}
 
@@ -435,7 +444,7 @@ func doesPathExist(path string) bool {
 	return err == nil
 }
 
-func errorIsetcdError(err error, errCode int) bool {
+func errorIsEtcdError(err error, errCode int) bool {
 	if err == nil {
 		return false
 	}
